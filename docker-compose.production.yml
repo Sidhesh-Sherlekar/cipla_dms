@@ -1,0 +1,317 @@
+version: '3.8'
+
+# Production Docker Compose for Cipla DMS
+# Optimized for 200 concurrent users on on-prem hosting
+# Includes PostgreSQL, Redis, monitoring, and resource limits
+
+services:
+  # PostgreSQL database
+  db:
+    image: postgres:15-alpine
+    container_name: cipla_dms_db_prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-cipla_dms}
+      POSTGRES_USER: ${DB_USER:-cipla_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Database password required}
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=en_US.UTF-8"
+      # Performance tuning for 200 users
+      POSTGRES_MAX_CONNECTIONS: "250"
+      POSTGRES_SHARED_BUFFERS: "512MB"
+      POSTGRES_EFFECTIVE_CACHE_SIZE: "2GB"
+      POSTGRES_WORK_MEM: "16MB"
+      POSTGRES_MAINTENANCE_WORK_MEM: "128MB"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db_backups:/backups
+    ports:
+      - "127.0.0.1:5432:5432"  # Only expose locally
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-cipla_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cipla_network
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+
+  # Redis for caching and WebSocket
+  redis:
+    image: redis:7-alpine
+    container_name: cipla_dms_redis_prod
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --tcp-backlog 511
+      --timeout 300
+      --tcp-keepalive 60
+      --maxclients 500
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - cipla_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 768M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Backend service (Django with Daphne for WebSocket)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cipla_dms_backend_prod
+    restart: unless-stopped
+    command: daphne -b 0.0.0.0 -p 8000 config.asgi:application
+    volumes:
+      - ./backend:/app
+      - backend_static:/app/staticfiles
+      - backend_media:/app/media
+      - backend_logs:/app/logs
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings_production
+      - DEBUG=False
+      - SECRET_KEY=${SECRET_KEY:?Secret key required}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?Allowed hosts required}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
+      - USE_POSTGRES=True
+      - DB_NAME=${DB_NAME:-cipla_dms}
+      - DB_USER=${DB_USER:-cipla_user}
+      - DB_PASSWORD=${DB_PASSWORD:?Database password required}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - REDIS_URL=redis://redis:6379/1
+      - REDIS_CACHE_URL=redis://redis:6379/2
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - EMAIL_HOST=${EMAIL_HOST}
+      - EMAIL_PORT=${EMAIL_PORT:-587}
+      - EMAIL_USE_TLS=${EMAIL_USE_TLS:-True}
+      - EMAIL_HOST_USER=${EMAIL_HOST_USER}
+      - EMAIL_HOST_PASSWORD=${EMAIL_HOST_PASSWORD}
+      - DEFAULT_FROM_EMAIL=${DEFAULT_FROM_EMAIL:-Cipla DMS <noreply@cipla.com>}
+      - EMAIL_ENABLED=${EMAIL_ENABLED:-True}
+      - APP_BASE_URL=${APP_BASE_URL}
+      - TIME_ZONE=${TIME_ZONE:-UTC}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - cipla_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+
+  # Celery worker for background tasks (email sending)
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cipla_dms_celery_prod
+    restart: unless-stopped
+    command: celery -A config worker -l info --concurrency=4
+    volumes:
+      - ./backend:/app
+      - backend_media:/app/media
+      - backend_logs:/app/logs
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings_production
+      - DEBUG=False
+      - SECRET_KEY=${SECRET_KEY:?Secret key required}
+      - USE_POSTGRES=True
+      - DB_NAME=${DB_NAME:-cipla_dms}
+      - DB_USER=${DB_USER:-cipla_user}
+      - DB_PASSWORD=${DB_PASSWORD:?Database password required}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - REDIS_URL=redis://redis:6379/1
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - EMAIL_HOST=${EMAIL_HOST}
+      - EMAIL_PORT=${EMAIL_PORT:-587}
+      - EMAIL_USE_TLS=${EMAIL_USE_TLS:-True}
+      - EMAIL_HOST_USER=${EMAIL_HOST_USER}
+      - EMAIL_HOST_PASSWORD=${EMAIL_HOST_PASSWORD}
+      - DEFAULT_FROM_EMAIL=${DEFAULT_FROM_EMAIL:-Cipla DMS <noreply@cipla.com>}
+      - EMAIL_ENABLED=${EMAIL_ENABLED:-True}
+      - APP_BASE_URL=${APP_BASE_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - cipla_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Celery Beat (periodic tasks scheduler for email reminders)
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cipla_dms_celery_beat_prod
+    restart: unless-stopped
+    command: celery -A config beat -l info --scheduler celery.beat:PersistentScheduler
+    volumes:
+      - ./backend:/app
+      - backend_logs:/app/logs
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings_production
+      - DEBUG=False
+      - SECRET_KEY=${SECRET_KEY:?Secret key required}
+      - USE_POSTGRES=True
+      - DB_NAME=${DB_NAME:-cipla_dms}
+      - DB_USER=${DB_USER:-cipla_user}
+      - DB_PASSWORD=${DB_PASSWORD:?Database password required}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - EMAIL_HOST=${EMAIL_HOST}
+      - EMAIL_PORT=${EMAIL_PORT:-587}
+      - EMAIL_USE_TLS=${EMAIL_USE_TLS:-True}
+      - EMAIL_HOST_USER=${EMAIL_HOST_USER}
+      - EMAIL_HOST_PASSWORD=${EMAIL_HOST_PASSWORD}
+      - DEFAULT_FROM_EMAIL=${DEFAULT_FROM_EMAIL:-Cipla DMS <noreply@cipla.com>}
+      - EMAIL_ENABLED=${EMAIL_ENABLED:-True}
+      - APP_BASE_URL=${APP_BASE_URL}
+    depends_on:
+      - redis
+      - db
+    networks:
+      - cipla_network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # Frontend (Nginx serving static React build)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.production
+      args:
+        VITE_API_URL: ${VITE_API_URL:-https://your-domain.com}
+        VITE_WS_URL: ${VITE_WS_URL:-wss://your-domain.com}
+    container_name: cipla_dms_frontend_prod
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - backend
+    networks:
+      - cipla_network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  # Nginx reverse proxy (SSL termination and load balancing)
+  nginx:
+    image: nginx:alpine
+    container_name: cipla_dms_nginx_prod
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - backend_static:/var/www/static:ro
+      - backend_media:/var/www/media:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - cipla_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  # Redis Insight (Redis monitoring UI - optional)
+  redis-insight:
+    image: redislabs/redisinsight:latest
+    container_name: cipla_dms_redis_insight
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - redis_insight_data:/db
+    networks:
+      - cipla_network
+    profiles:
+      - monitoring
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+
+networks:
+  cipla_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_static:
+    driver: local
+  backend_media:
+    driver: local
+  backend_logs:
+    driver: local
+  redis_insight_data:
+    driver: local

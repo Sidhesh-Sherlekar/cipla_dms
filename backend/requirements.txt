@@ -1,0 +1,26 @@
+django==4.2.7
+djangorestframework==3.14.0
+django-cors-headers==4.3.0
+psycopg2-binary==2.9.9
+python-decouple==3.8
+djangorestframework-simplejwt==5.3.0
+django-filter==23.3
+django-ratelimit==4.1.0
+django-axes==6.1.1
+whitenoise==6.6.0
+celery==5.3.4
+redis==5.0.1
+cryptography==41.0.7
+
+# WebSocket support
+channels==4.0.0
+daphne==4.0.0
+channels-redis==4.1.0
+
+# Barcode generation
+python-barcode==0.15.1
+qrcode[pil]==7.4.2
+Pillow==10.1.0
+
+# Excel export
+openpyxl==3.1.2

@@ -1,0 +1,9 @@
+FROM node:22.11
+
+COPY ./Frontend /Frontend
+RUN rm -rf /Frontend/node_modules
+
+WORKDIR /Frontend
+RUN npm ci
+
+CMD ["npm", "run", "dev"]
